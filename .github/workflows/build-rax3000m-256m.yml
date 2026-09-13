@@ -1,0 +1,107 @@
+name: Build RAX3000M 256M Firmware (ImmortalWrt 25.x)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: '进入 SSH 调试 menuconfig'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  REPO_BRANCH: openwrt-25.12
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout 本仓库
+        uses: actions/checkout@v4
+
+      - name: 清理磁盘
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          large-packages: true
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \
+            haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \
+            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \
+            libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \
+            ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+            python3-ply python3-docutils python3-pyelftools qemu-utils \
+            re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: 克隆源码 (ImmortalWrt 25.12)
+        run: |
+          git clone $REPO_URL -b $REPO_BRANCH --single-branch --filter=blob:none openwrt
+
+      - name: 执行 diy-part1.sh（自定义 feeds）
+        run: |
+          cd openwrt
+          if [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then
+            chmod +x $GITHUB_WORKSPACE/diy-part1.sh
+            $GITHUB_WORKSPACE/diy-part1.sh
+          fi
+
+      - name: 更新 & 安装 feeds
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 执行 diy-part2.sh（修改分区 + 其他定制）
+        run: |
+          cd openwrt
+          if [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then
+            chmod +x $GITHUB_WORKSPACE/diy-part2.sh
+            $GITHUB_WORKSPACE/diy-part2.sh
+          fi
+
+      - name: 加载设备配置
+        run: |
+          cp -f $GITHUB_WORKSPACE/rax3000m-256m.config openwrt/.config
+          cd openwrt
+          make defconfig
+
+      - name: SSH 调试（可选，手动 menuconfig）
+        if: ${{ github.event.inputs.ssh == 'true' }}
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 30
+
+      - name: 下载源码包
+        run: |
+          cd openwrt
+          make download -j$(nproc) 2>&1 | tail -20
+
+      - name: 编译固件
+        run: |
+          cd openwrt
+          echo "======== 开始编译，预计 1-2 小时 ========"
+          make -j$(nproc) || make -j1 V=s
+
+      - name: 整理固件产物
+        run: |
+          mkdir -p firmware
+          find openwrt/bin/targets/ -type f \( -name "*.bin" -o -name "*.itb" \) -exec cp {} firmware/ \;
+          echo "=== 编译产物列表 ==="
+          ls -lh firmware/
+
+      - name: 上传固件到 Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rax3000m-256m-immortalwrt-25.12
+          path: firmware/
