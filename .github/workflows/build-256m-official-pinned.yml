@@ -26,6 +26,9 @@ jobs:
       ok: ${{ steps.probe.outputs.ok }}
     steps:
     - &id001
+      name: Checkout 本仓库（拿 diy 脚本）
+      uses: actions/checkout@v4
+    - &id002
       name: 清理磁盘
       uses: jlumbroso/free-disk-space@main
       with:
@@ -98,6 +101,7 @@ jobs:
       contents: write
     steps:
     - *id001
+    - *id002
     - name: 安装编译依赖
       run: "sudo apt-get update -qq\nsudo apt-get install -y --no-install-recommends \\\n  ack antlr3 asciidoc autoconf automake autopoint binutils bison \\\n  build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \\\n  fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \\\n  haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \\\n  libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \\\n  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \\\n  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \\\n  python3-ply python3-docutils python3-pyelftools qemu-utils \\\n  re2c rsync scons squashfs-tools subversion swig texinfo \\\n  uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd\nsudo timedatectl set-timezone \"$TZ\"\necho \"nproc=$(nproc)\""
     - name: 克隆 tag（官方 config 为底，随后收敛为单设备）
