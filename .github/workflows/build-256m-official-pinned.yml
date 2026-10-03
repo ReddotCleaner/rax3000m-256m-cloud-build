@@ -22,6 +22,92 @@ env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt.git
   TZ: Asia/Shanghai
 jobs:
+  preflight:
+    name: 开跑前自检（2 分钟；拦住脚本级错误，不浪费 4 小时编译）
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+    - name: Checkout 本仓库
+      uses: actions/checkout@v4
+    - name: 自检（文件/内核配置/语法/附件清单/校验和/探针逻辑）
+      run: |
+        set -e
+        echo "=== [自检 0] 仓库必需文件 ==="
+        for f in diy-part2.sh official-kernel-config/kernel.config.set official-kernel-config/vermagic; do
+          if [ ! -f "$f" ]; then echo "ERROR: 缺少 $f"; exit 1; fi
+          echo "  ✓ $f"
+        done
+
+        echo "=== [自检 1] 官方内核配置 md5 == 官方值 ==="
+        OURS=$(grep '=[ym]' official-kernel-config/kernel.config.set | LC_ALL=C sort | md5sum | cut -d' ' -f1)
+        OFFI="${{ inputs.expected_khash }}"
+        echo "  ours=$OURS official=$OFFI"
+        [ "$OURS" = "$OFFI" ] || { echo "ERROR: 内核配置与官方不一致，钉进去也装不上官方 kmod"; exit 1; }
+
+        echo "=== [自检 2] 本 workflow 所有 run 脚本 bash -n 语法检查 ==="
+        if python3 -c "import yaml" 2>/dev/null; then
+        python3 - <<'PY'
+        import yaml, subprocess, sys, pathlib, tempfile
+        wf = yaml.safe_load(pathlib.Path('.github/workflows/build-256m-official-pinned.yml').read_text())
+        bad = 0
+        for jn, job in wf['jobs'].items():
+            for i, st in enumerate(job['steps'], 1):
+                r = st.get('run')
+                if not r: continue
+                with tempfile.NamedTemporaryFile('w', suffix='.sh', delete=False) as fh:
+                    fh.write("#!/bin/bash\nset -e\n" + r + "\n"); p = fh.name
+                pr = subprocess.run(['bash', '-n', p], capture_output=True, text=True)
+                if pr.returncode:
+                    print(f"  ERROR [{jn} step {i} {st.get('name')}]: {pr.stderr.strip()[:200]}"); bad += 1
+        print(f"  语法检查完成，问题数: {bad}")
+        sys.exit(1 if bad else 0)
+        PY
+        else
+          echo "  （runner 无 pyyaml，跳过本项自检；已在本机验证过）"
+        fi
+
+        echo "=== [自检 3] 附件清单逻辑：目录绝不能被当成附件（上次翻车点）==="
+        S=$(mktemp -d); cd "$S"
+        touch a.bin b.itb; mkdir -p official-kernel-config; touch official-kernel-config/x.txt
+        FILES=$(find . -maxdepth 1 -type f -name '*' -printf '%f\n' | sort)
+        echo "  解析出的附件: $(echo "$FILES" | tr '\n' ' ')"
+        echo "$FILES" | grep -qx 'official-kernel-config' && { echo "ERROR: 目录混进附件清单了"; exit 1; }
+        [ "$(echo "$FILES" | wc -l)" -eq 2 ] || { echo "ERROR: 附件数量不对（应为 2）"; exit 1; }
+        echo "  ✓ 只取文件、排除目录"
+
+        echo "=== [自检 4] 校验和逻辑：目录在场也不许报错（上次翻车点）==="
+        find . -maxdepth 1 -type f ! -name sha256sums -print0 | sort -z | xargs -0 sha256sum > sha256sums
+        echo "  ✓ 生成 $(wc -l < sha256sums) 行校验和，退出码 0"
+        sha256sum -c sha256sums >/dev/null || { echo "ERROR: 自查校验失败"; exit 1; }
+        cd - >/dev/null; rm -rf "$S"
+
+        echo "=== [自检 5] 布局校验逻辑（正例必须通过、反例必须拦下）==="
+        python3 - <<'PY'
+        import os, tempfile, subprocess, sys
+        def probe(data):
+            p = tempfile.mktemp(suffix='.itb')
+            open(p, 'wb').write(data)
+            code = ("b=open(%r,'rb').read()\n"
+                    "ok=bytes.fromhex('005800000fa80000') in b\n"
+                    "bad=bytes.fromhex('0058000007200000') in b\n"
+                    "raise SystemExit(0 if (ok and not bad) else 1)\n") % p
+            r = subprocess.run([sys.executable, '-c', code])
+            os.unlink(p)
+            return r.returncode
+        good = probe(b'XXXX' + bytes.fromhex('005800000fa80000') + b'YYYY')
+        bad = probe(b'XXXX' + bytes.fromhex('0058000007200000') + b'YYYY')
+        print(f"  正例(250.5M) rc={good} 应为 0 ; 反例(114M) rc={bad} 应为 1")
+        sys.exit(0 if (good == 0 and bad == 1) else 1)
+        PY
+
+        echo "=== [自检 6] 内核 hash 探针逻辑（用假 packages 目录验证提取/比对）==="
+        S=$(mktemp -d); mkdir -p "$S/pkgs"; touch "$S/pkgs/kernel-6.12.103~${{ inputs.expected_khash }}-r1.apk"
+        OURS=$(ls -1 "$S/pkgs" | grep -oiE '[0-9a-f]{32}' | sort -u | head -1)
+        [ "$OURS" = "${{ inputs.expected_khash }}" ] || { echo "ERROR: hash 探针提取有误 (ours=$OURS)"; exit 1; }
+        echo "  ✓ 探针能正确提取内核 hash: $OURS"
+        rm -rf "$S"
+
+        echo "=== 全部自检通过 ✅ 可以开始编译 ==="
   seed:
     name: 阶段A：用官方 config 生成「官方内核配置」并校验 hash
     runs-on: ubuntu-22.04
@@ -41,54 +127,67 @@ jobs:
         dotnet: true
         large-packages: true
     - name: 安装编译依赖
-      run: "sudo apt-get update -qq\nsudo apt-get install -y --no-install-recommends \\\n  ack antlr3 asciidoc autoconf automake autopoint binutils bison \\\n  build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \\\n  fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \\\n  haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \\\n  libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \\\n  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \\\n  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \\\n  python3-ply python3-docutils python3-pyelftools qemu-utils \\\n  re2c rsync scons squashfs-tools subversion swig texinfo \\\n  uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd\nsudo timedatectl set-timezone \"$TZ\"\necho \"nproc=$(nproc)\""
+      run: |-
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+          build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+          fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \
+          haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \
+          libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \
+          libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \
+          ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+          python3-ply python3-docutils python3-pyelftools qemu-utils \
+          re2c rsync scons squashfs-tools subversion swig texinfo \
+          uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd
+        sudo timedatectl set-timezone "$TZ"
+        echo "nproc=$(nproc)"
     - name: 克隆 tag 并铺官方 config / feeds / DTS 补丁
-      run: 'TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
-
+      run: |-
+        TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
         git clone $REPO_URL -b "$TAG" --single-branch --depth 1 openwrt
-
         cd openwrt
-
         curl -fsSL -o .config "https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo"
-
-        grep -q ''^CONFIG_TARGET_mediatek_filogic=y'' .config || { echo "ERROR: config.buildinfo 不对"; exit 1; }
-
+        grep -q '^CONFIG_TARGET_mediatek_filogic=y' .config || { echo "ERROR: config.buildinfo 不对"; exit 1; }
         if [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part1.sh; $GITHUB_WORKSPACE/diy-part1.sh; fi
-
         ./scripts/feeds update -a
-
         ./scripts/feeds install -a
-
         if [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part2.sh; $GITHUB_WORKSPACE/diy-part2.sh; fi
-
-        grep -q ''reg = <0x580000 0xFA80000>;'' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo "ERROR: DTS 未改 250.5MB"; exit 1; }
-
-        make defconfig'
+        grep -q 'reg = <0x580000 0xFA80000>;' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo "ERROR: DTS 未改 250.5MB"; exit 1; }
+        make defconfig
     - name: 编 tools + toolchain + 内核（只为拿到官方内核配置）
-      run: 'cd openwrt
-
+      run: |-
+        cd openwrt
         make -j$(nproc) tools/compile toolchain/compile 2>&1 | tail -5
-
         timeout 2400 make -j$(nproc) target/linux/compile 2>&1 | tail -30 || true
-
         LINDIR=$(ls -d build_dir/target-*/linux-mediatek_filogic/linux-6.12.* 2>/dev/null | head -1)
-
         echo "LINUX_DIR=$LINDIR"
-
         ls -l "$LINDIR/.config" "$LINDIR/.config.set" "$LINDIR/.vermagic" 2>/dev/null || true
-
         mkdir -p /tmp/kcfg
-
         cp -f "$LINDIR/.config.set" /tmp/kcfg/kernel.config.set
-
         cp -f "$LINDIR/.config"     /tmp/kcfg/kernel.config
-
         cp -f "$LINDIR/.vermagic"   /tmp/kcfg/vermagic
-
-        ls -l /tmp/kcfg/'
+        ls -l /tmp/kcfg/
     - name: 校验官方内核 hash（决定 kmod 兼容性）
       id: probe
-      run: "cd openwrt\nmkdir -p /tmp/kcfg 2>/dev/null\nOURS=$(grep '=[ym]' /tmp/kcfg/kernel.config.set | LC_ALL=C sort | md5sum | cut -d' ' -f1)\nVERMAGIC=$(cat /tmp/kcfg/vermagic 2>/dev/null | head -c 64)\nOFFI=\"${{ inputs.expected_khash }}\"\necho \"=== seed hash probe: ours=$OURS  vermagic_file=$VERMAGIC  official=$OFFI ===\"\nif [ \"$OURS\" = \"$OFFI\" ]; then\n  echo \"=== 结论：官方 config 复现出的内核配置 hash 与官方一致 ✅ 该配置可作为「官方内核」钉进单设备编译 ===\"\n  echo \"ok=true\" >> \"$GITHUB_OUTPUT\"\nelse\n  echo \"=== 结论：不一致 ❌（那说明还需要别的对齐手段）===\"\n  echo \"ok=false\" >> \"$GITHUB_OUTPUT\"\nfi\necho \"kernel_config_md5=$OURS\" > /tmp/kcfg/INFO.txt\necho \"vermagic_file=$VERMAGIC\" >> /tmp/kcfg/INFO.txt\necho \"official=$OFFI\" >> /tmp/kcfg/INFO.txt\ncat /tmp/kcfg/INFO.txt"
+      run: |-
+        cd openwrt
+        mkdir -p /tmp/kcfg 2>/dev/null
+        OURS=$(grep '=[ym]' /tmp/kcfg/kernel.config.set | LC_ALL=C sort | md5sum | cut -d' ' -f1)
+        VERMAGIC=$(cat /tmp/kcfg/vermagic 2>/dev/null | head -c 64)
+        OFFI="${{ inputs.expected_khash }}"
+        echo "=== seed hash probe: ours=$OURS  vermagic_file=$VERMAGIC  official=$OFFI ==="
+        if [ "$OURS" = "$OFFI" ]; then
+          echo "=== 结论：官方 config 复现出的内核配置 hash 与官方一致 ✅ 该配置可作为「官方内核」钉进单设备编译 ==="
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "=== 结论：不一致 ❌（那说明还需要别的对齐手段）==="
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+        fi
+        echo "kernel_config_md5=$OURS" > /tmp/kcfg/INFO.txt
+        echo "vermagic_file=$VERMAGIC" >> /tmp/kcfg/INFO.txt
+        echo "official=$OFFI" >> /tmp/kcfg/INFO.txt
+        cat /tmp/kcfg/INFO.txt
     - name: 上传官方内核配置
       uses: actions/upload-artifact@v4
       with:
@@ -99,6 +198,7 @@ jobs:
   build:
     name: 阶段B：单设备（只编 rax3000m）+ 钉入官方内核配置 → 官方 kmod 可直装
     needs:
+    - preflight
     - seed
     runs-on: ubuntu-22.04
     timeout-minutes: 350
@@ -108,35 +208,78 @@ jobs:
     - *id001
     - *id002
     - name: 安装编译依赖
-      run: "sudo apt-get update -qq\nsudo apt-get install -y --no-install-recommends \\\n  ack antlr3 asciidoc autoconf automake autopoint binutils bison \\\n  build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \\\n  fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \\\n  haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \\\n  libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \\\n  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \\\n  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \\\n  python3-ply python3-docutils python3-pyelftools qemu-utils \\\n  re2c rsync scons squashfs-tools subversion swig texinfo \\\n  uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd\nsudo timedatectl set-timezone \"$TZ\"\necho \"nproc=$(nproc)\""
+      run: |-
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+          build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+          fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \
+          haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \
+          libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \
+          libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \
+          ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+          python3-ply python3-docutils python3-pyelftools qemu-utils \
+          re2c rsync scons squashfs-tools subversion swig texinfo \
+          uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd
+        sudo timedatectl set-timezone "$TZ"
+        echo "nproc=$(nproc)"
     - name: 恢复构建缓存（重跑可续）
       uses: actions/cache@v4
       with:
-        path: 'openwrt/staging_dir
-
+        path: |-
+          openwrt/staging_dir
           openwrt/build_dir
-
-          openwrt/bin'
+          openwrt/bin
         key: owrt-pinned-${{ inputs.release_tag }}-g1
         restore-keys: owrt-pinned-${{ inputs.release_tag }}-
     - name: 克隆 tag（官方 config 为底，随后收敛为单设备）
-      run: "TAG=\"${{ inputs.release_tag }}\"; VER=\"${TAG#v}\"\n# 缓存恢复会在 workspace 里预建 openwrt/ 目录 → git clone 会因“目标非空”失败(exit 128)，先把它挪开\nif [ -e openwrt ]; then\n  rm -rf openwrt.keep; mkdir -p openwrt.keep\n  for d in staging_dir build_dir bin; do\n    if [ -d \"openwrt/$d\" ]; then mv \"openwrt/$d\" \"openwrt.keep/$d\"; fi\n  done\n  rm -rf openwrt\nfi\ngit clone $REPO_URL -b \"$TAG\" --single-branch --depth 1 openwrt\n# 把缓存里的构建产物并回新 clone 的源码树，保留“重跑可续”\nif [ -d openwrt.keep ]; then\n  for d in staging_dir build_dir bin; do\n    if [ -d \"openwrt.keep/$d\" ]; then mv \"openwrt.keep/$d\" \"openwrt/$d\"; fi\n  done\n  rm -rf openwrt.keep\nfi\ncd openwrt\ncurl -fsSL -o .config \"https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo\"\n# ---- 收敛为单台设备（只编 cmcc_rax3000m）----\nsed -i 's/^CONFIG_TARGET_ALL_PROFILES=y/# CONFIG_TARGET_ALL_PROFILES is not set/' .config || true\n{\n  echo '# CONFIG_TARGET_ALL_PROFILES is not set'\n  echo 'CONFIG_TARGET_PROFILE=\"DEVICE_cmcc_rax3000m\"'\n  echo 'CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m=y'\n} >> .config\nif [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part1.sh; $GITHUB_WORKSPACE/diy-part1.sh; fi\n./scripts/feeds update -a\n./scripts/feeds install -a\nif [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part2.sh; $GITHUB_WORKSPACE/diy-part2.sh; fi\ngrep -q 'reg = <0x580000 0xFA80000>;' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo \"ERROR: DTS 未改\"; exit 1; }\nmake defconfig\necho \"=== 单设备确认 ===\"\ngrep -E '^CONFIG_TARGET_(ALL_PROFILES|PROFILE)|DEVICE_cmcc_rax3000m=y' .config\necho \"=== image packages (=y): $(grep -c '^CONFIG_PACKAGE_.*=y$' .config || true) ===\"\nmake download -j$(nproc) 2>&1 | tail -3"
+      run: |-
+        TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
+        # 缓存恢复会在 workspace 里预建 openwrt/ 目录 → git clone 会因“目标非空”失败(exit 128)，先把它挪开
+        if [ -e openwrt ]; then
+          rm -rf openwrt.keep; mkdir -p openwrt.keep
+          for d in staging_dir build_dir bin; do
+            if [ -d "openwrt/$d" ]; then mv "openwrt/$d" "openwrt.keep/$d"; fi
+          done
+          rm -rf openwrt
+        fi
+        git clone $REPO_URL -b "$TAG" --single-branch --depth 1 openwrt
+        # 把缓存里的构建产物并回新 clone 的源码树，保留“重跑可续”
+        if [ -d openwrt.keep ]; then
+          for d in staging_dir build_dir bin; do
+            if [ -d "openwrt.keep/$d" ]; then mv "openwrt.keep/$d" "openwrt/$d"; fi
+          done
+          rm -rf openwrt.keep
+        fi
+        cd openwrt
+        curl -fsSL -o .config "https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo"
+        # ---- 收敛为单台设备（只编 cmcc_rax3000m）----
+        sed -i 's/^CONFIG_TARGET_ALL_PROFILES=y/# CONFIG_TARGET_ALL_PROFILES is not set/' .config || true
+        {
+          echo '# CONFIG_TARGET_ALL_PROFILES is not set'
+          echo 'CONFIG_TARGET_PROFILE="DEVICE_cmcc_rax3000m"'
+          echo 'CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m=y'
+        } >> .config
+        if [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part1.sh; $GITHUB_WORKSPACE/diy-part1.sh; fi
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        if [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part2.sh; $GITHUB_WORKSPACE/diy-part2.sh; fi
+        grep -q 'reg = <0x580000 0xFA80000>;' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo "ERROR: DTS 未改"; exit 1; }
+        make defconfig
+        echo "=== 单设备确认 ==="
+        grep -E '^CONFIG_TARGET_(ALL_PROFILES|PROFILE)|DEVICE_cmcc_rax3000m=y' .config
+        echo "=== image packages (=y): $(grep -c '^CONFIG_PACKAGE_.*=y$' .config || true) ==="
+        make download -j$(nproc) 2>&1 | tail -3
     - name: 编 tools + toolchain
-      run: 'cd openwrt
-
+      run: |-
+        cd openwrt
         make -j$(nproc) tools/compile toolchain/compile 2>&1 | tail -5
-
         # 先让它生成自己的（单设备）内核配置，随后被官方配置覆盖
-
         timeout 2400 make -j$(nproc) target/linux/prepare V=s 2>&1 | tail -20 || true
-
         LINDIR=$(ls -d build_dir/target-*/linux-mediatek_filogic/linux-6.12.* 2>/dev/null | head -1)
-
         echo "LINUX_DIR=$LINDIR"
-
         echo "$LINDIR" > /tmp/lindir.txt
-
-        ls -d $LINDIR/*.configured* $LINDIR/.config $LINDIR/.config.set 2>/dev/null || true'
+        ls -d $LINDIR/*.configured* $LINDIR/.config $LINDIR/.config.set 2>/dev/null || true
     - name: 下载官方内核配置并钉入
       uses: actions/download-artifact@v4
       with:
@@ -144,89 +287,69 @@ jobs:
         path: /tmp/kcfg
       if: inputs.use_committed_config != 'true'
     - name: 覆盖单设备内核配置为官方内核配置（关键步骤）
-      run: 'cd openwrt
-
-        LINDIR=$(cat /tmp/lindir.txt)
-
-        echo "LINUX_DIR=$LINDIR"
-
-        KC=/tmp/kcfg
-
-        if [ ! -f "$KC/kernel.config.set" ]; then KC="$GITHUB_WORKSPACE/official-kernel-config"; fi
-
-        echo "=== 使用的官方内核配置来源: $KC ==="
-
-        ls -l "$KC"/
-
-        (grep ''=[ym]'' "$KC/kernel.config.set" | LC_ALL=C sort | md5sum | cut -d'' '' -f1) || true
-
-        cp -f "$KC"/kernel.config.set "$LINDIR/.config.set"
-
-        cp -f "$KC"/kernel.config     "$LINDIR/.config"
-
-        cp -f "$KC"/kernel.config     "$LINDIR/.config.prev"
-
-        cp -f "$KC"/vermagic          "$LINDIR/.vermagic"
-
-        # 让 make 认为「已配置」，不再重新合并内核配置
-
-        touch "$LINDIR/.configured"* "$LINDIR/.prepared"* 2>/dev/null || true
-
-        touch "$LINDIR/.config" "$LINDIR/.config.set" "$LINDIR/.vermagic"
-
-        echo "=== 钉入后的内核 hash ==="
-
-        grep ''=[ym]'' "$LINDIR/.config.set" | LC_ALL=C sort | md5sum | cut -d'' '' -f1
-
-        cat "$LINDIR/.vermagic"; echo
-
-        echo "(期望与官方 ${{ inputs.expected_khash }} 相同)" '
+      run: "cd openwrt\nLINDIR=$(cat /tmp/lindir.txt)\necho \"LINUX_DIR=$LINDIR\"\nKC=/tmp/kcfg\nif [ ! -f \"$KC/kernel.config.set\" ]; then KC=\"$GITHUB_WORKSPACE/official-kernel-config\"; fi\necho \"=== 使用的官方内核配置来源: $KC ===\"\nls -l \"$KC\"/\n(grep '=[ym]' \"$KC/kernel.config.set\" | LC_ALL=C sort | md5sum | cut -d' ' -f1) || true\ncp -f \"$KC\"/kernel.config.set \"$LINDIR/.config.set\"\ncp -f \"$KC\"/kernel.config     \"$LINDIR/.config\"\ncp -f \"$KC\"/kernel.config     \"$LINDIR/.config.prev\"\ncp -f \"$KC\"/vermagic          \"$LINDIR/.vermagic\"\n# 让 make 认为「已配置」，不再重新合并内核配置\ntouch \"$LINDIR/.configured\"* \"$LINDIR/.prepared\"* 2>/dev/null || true\ntouch \"$LINDIR/.config\" \"$LINDIR/.config.set\" \"$LINDIR/.vermagic\"\necho \"=== 钉入后的内核 hash ===\"\ngrep '=[ym]' \"$LINDIR/.config.set\" | LC_ALL=C sort | md5sum | cut -d' ' -f1\ncat \"$LINDIR/.vermagic\"; echo\necho \"(期望与官方 ${{ inputs.expected_khash }} 相同)\" "
     - name: 编译（单设备，预计 1.5-3 小时）
-      run: 'cd openwrt
-
-        echo "======== 开始编译 ========"; date -u
-
-        timeout 16000 make -j$(nproc) || { echo "=== 到点或失败，V=s 再试 ==="; timeout 3000 make -j$(nproc) V=s; }
-
-        date -u
-
-        LINDIR=$(cat /tmp/lindir.txt)
-
-        echo "=== 编译后内核配置 hash（必须仍等于官方）==="
-
-        grep ''=[ym]'' "$LINDIR/.config.set" | LC_ALL=C sort | md5sum | cut -d'' '' -f1
-
-        cat "$LINDIR/.vermagic"; echo
-
-        ls -lh bin/targets/mediatek/filogic/*cmcc_rax3000m*.itb 2>/dev/null || echo "（没出 itb）" '
+      run: "cd openwrt\necho \"======== 开始编译 ========\"; date -u\ntimeout 16000 make -j$(nproc) || { echo \"=== 到点或失败，V=s 再试 ===\"; timeout 3000 make -j$(nproc) V=s; }\ndate -u\nLINDIR=$(cat /tmp/lindir.txt)\necho \"=== 编译后内核配置 hash（必须仍等于官方）===\"\ngrep '=[ym]' \"$LINDIR/.config.set\" | LC_ALL=C sort | md5sum | cut -d' ' -f1\ncat \"$LINDIR/.vermagic\"; echo\nls -lh bin/targets/mediatek/filogic/*cmcc_rax3000m*.itb 2>/dev/null || echo \"（没出 itb）\" "
     - name: 保存构建缓存
       uses: actions/cache/save@v4
       continue-on-error: true
       with:
-        path: 'openwrt/staging_dir
-
+        path: |-
+          openwrt/staging_dir
           openwrt/build_dir
-
-          openwrt/bin'
+          openwrt/bin
         key: owrt-pinned-${{ inputs.release_tag }}-g2-${{ github.run_id }}
     - name: 校验（布局 + 我们的 kernel 包 hash vs 官方）
-      run: "cd openwrt\nITB=$(ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)\necho \"ITB = $ITB\"\npython3 -c \"\nb=open('$ITB','rb').read()\nok=bytes.fromhex('005800000fa80000') in b\nbad=bytes.fromhex('0058000007200000') in b\nprint('=== layout probe: ubi=250.5M', ok, '| 114M', bad, '===')\nraise SystemExit(0 if (ok and not bad) else 1)\n\"\necho \"=== 我们编出的 kernel 包 ===\"\nls -1 bin/targets/mediatek/filogic/packages/ | grep -iE '^kernel' | head -5\nOURS=$(ls -1 bin/targets/mediatek/filogic/packages/ | grep -oiE '[0-9a-f]{32}' | sort -u | head -1)\nOFFI=\"${{ inputs.expected_khash }}\"\necho \"ours=${OURS:-none} official=${OFFI}\"\nif [ \"$OURS\" = \"$OFFI\" ]; then\n  echo \"=== kmod hash probe: MATCH ($OURS) -> 官方 release 的 kmod 可直接 apk add ✅ ===\"\n  echo \"kmod_compat=MATCH\" >> \"$GITHUB_WORKSPACE/kmod_probe.txt\"\nelse\n  echo \"=== kmod hash probe: MISMATCH ours=${OURS:-none} official=${OFFI} ===\"\n  echo \"kmod_compat=MISMATCH(ours=${OURS:-none},official=${OFFI})\" >> \"$GITHUB_WORKSPACE/kmod_probe.txt\"\nfi\necho \"=== kmod 包数量（应为官方 kmods 目录可补的形态）===\"\nls -1 bin/targets/mediatek/filogic/packages/ | grep -c '^kmod-' || true"
+      run: |-
+        cd openwrt
+        ITB=$(ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)
+        echo "ITB = $ITB"
+        python3 -c "
+        b=open('$ITB','rb').read()
+        ok=bytes.fromhex('005800000fa80000') in b
+        bad=bytes.fromhex('0058000007200000') in b
+        print('=== layout probe: ubi=250.5M', ok, '| 114M', bad, '===')
+        raise SystemExit(0 if (ok and not bad) else 1)
+        "
+        echo "=== 我们编出的 kernel 包 ==="
+        ls -1 bin/targets/mediatek/filogic/packages/ | grep -iE '^kernel' | head -5
+        OURS=$(ls -1 bin/targets/mediatek/filogic/packages/ | grep -oiE '[0-9a-f]{32}' | sort -u | head -1)
+        OFFI="${{ inputs.expected_khash }}"
+        echo "ours=${OURS:-none} official=${OFFI}"
+        if [ "$OURS" = "$OFFI" ]; then
+          echo "=== kmod hash probe: MATCH ($OURS) -> 官方 release 的 kmod 可直接 apk add ✅ ==="
+          echo "kmod_compat=MATCH" >> "$GITHUB_WORKSPACE/kmod_probe.txt"
+        else
+          echo "=== kmod hash probe: MISMATCH ours=${OURS:-none} official=${OFFI} ==="
+          echo "kmod_compat=MISMATCH(ours=${OURS:-none},official=${OFFI})" >> "$GITHUB_WORKSPACE/kmod_probe.txt"
+        fi
+        echo "=== kmod 包数量（应为官方 kmods 目录可补的形态）==="
+        ls -1 bin/targets/mediatek/filogic/packages/ | grep -c '^kmod-' || true
     - name: 打包离线包仓库（稳妥起见）
-      run: 'cd openwrt
-
+      run: |-
+        cd openwrt
         rm -rf /tmp/offline && mkdir -p /tmp/offline/packages /tmp/offline/target-packages 2>/dev/null || true
-
         cp -a bin/packages/. /tmp/offline/packages/ 2>/dev/null || true
-
         [ -d bin/targets/mediatek/filogic/packages ] && cp -a bin/targets/mediatek/filogic/packages/. /tmp/offline/target-packages/ 2>/dev/null
-
-        echo "userspace apk: $(find /tmp/offline/packages -name ''*.apk'' | wc -l)"
-
-        echo "kmod/target apk: $(find /tmp/offline/target-packages -name ''*.apk'' | wc -l)"
-
-        tar -czf rax3000m-256m-offline-packages.tar.gz -C /tmp/offline . 2>/dev/null; ls -lh rax3000m-256m-offline-packages.tar.gz || true'
+        echo "userspace apk: $(find /tmp/offline/packages -name '*.apk' | wc -l)"
+        echo "kmod/target apk: $(find /tmp/offline/target-packages -name '*.apk' | wc -l)"
+        tar -czf rax3000m-256m-offline-packages.tar.gz -C /tmp/offline . 2>/dev/null; ls -lh rax3000m-256m-offline-packages.tar.gz || true
     - name: 整理产物
-      run: "mkdir -p firmware\nfind openwrt/bin/targets/mediatek/filogic -maxdepth 1 -type f \\\n  \\( -name '*cmcc_rax3000m*.itb' -o -name '*cmcc_rax3000m*.fip' -o -name '*cmcc_rax3000m*preloader*.bin' -o -name '*cmcc_rax3000m*.manifest' -o -name 'version.buildinfo' -o -name 'profiles.json' \\) \\\n  -exec cp {} firmware/ \\;\ncp -f openwrt/rax3000m-256m-offline-packages.tar.gz firmware/ 2>/dev/null || true\ncp -f $GITHUB_WORKSPACE/kmod_probe.txt firmware/kmod_probe.txt 2>/dev/null || true\nSRC_KCFG=/tmp/kcfg; [ -d \"$SRC_KCFG\" ] || SRC_KCFG=\"$GITHUB_WORKSPACE/official-kernel-config\"; mkdir -p firmware/official-kernel-config && cp -f \"$SRC_KCFG\"/* firmware/official-kernel-config/ 2>/dev/null || true\nls -lh firmware/\ncd firmware\nfind . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > sha256sums   # 只对文件算，目录会报错\ncat sha256sums\nls -1 official-kernel-config/ 2>/dev/null || true"
+      run: |-
+        mkdir -p firmware
+        find openwrt/bin/targets/mediatek/filogic -maxdepth 1 -type f \
+          \( -name '*cmcc_rax3000m*.itb' -o -name '*cmcc_rax3000m*.fip' -o -name '*cmcc_rax3000m*preloader*.bin' -o -name '*cmcc_rax3000m*.manifest' -o -name 'version.buildinfo' -o -name 'profiles.json' \) \
+          -exec cp {} firmware/ \;
+        cp -f openwrt/rax3000m-256m-offline-packages.tar.gz firmware/ 2>/dev/null || true
+        cp -f "$GITHUB_WORKSPACE/kmod_probe.txt" firmware/kmod_probe.txt 2>/dev/null || true
+        # 官方内核配置：打包成「单文件」（绝不用目录做附件 —— 这是上次翻车点）
+        KC=/tmp/kcfg; [ -f "$KC/kernel.config.set" ] || KC="$GITHUB_WORKSPACE/official-kernel-config"
+        tar -czf firmware/official-kernel-config.tar.gz -C "$KC" . 2>/dev/null || true
+        ls -lh firmware/
+        cd firmware
+        ls -1 . ; echo "--- 生成的 sha256sums（排除自身、只算文件）---"
+        find . -maxdepth 1 -type f ! -name sha256sums -print0 | sort -z | xargs -0 sha256sum > sha256sums
+        cat sha256sums
     - name: 上传 Artifact
       uses: actions/upload-artifact@v4
       with:
@@ -237,5 +360,43 @@ jobs:
       if: ${{ inputs.make_release == 'true' }}
       env:
         GH_TOKEN: ${{ github.token }}
-      run: "set -e\ncd firmware\nVER=\"${{ inputs.release_tag }}\"; VER=\"${VER#v}\"\nTAG=\"rax3000m-256m-immortalwrt-${VER}-official-lean-$(date -u +%Y%m%d-%H%M)\"\nITB=$(ls *cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)\nPROBE=$(cat kmod_probe.txt 2>/dev/null || echo \"kmod_compat=UNKNOWN\")\n{\n  echo \"## RAX3000M NAND 256M · ImmortalWrt **${VER}**「官方内核 + 单设备精简包」\"\n  echo\n  echo \"做法：\\`.config\\` 用官方 config 生成过一次**官方内核配置**（hash 复现校验通过），\"\n  echo \"然后**只编 rax3000m 一台设备**，并把内核配置钉成官方那份 →\"\n  echo \"**官方 release 源的 kmod-\\* 可直接 apk add**，同时固件比官方版更精简。\"\n  echo\n  echo \"| 项 | 值 |\"\n  echo \"|---|---|\"\n  echo \"| 源码 | immortalwrt @ tag **${{ inputs.release_tag }}**（feeds 按 commit 锁定）|\"\n  echo \"| 内核配置 | 官方 config 复现（md5 = \\`${{ inputs.expected_khash }}\\`）|\"\n  echo \"| 设备 | **只编 \\`cmcc_rax3000m\\`**（单设备，不是全 subtarget）|\"\n  echo \"| 唯一源码改动 | ubi 114M → **250.5MB** |\"\n  echo \"| 版本 | \\`${VER}\\` |\"\n  echo \"| apk 源 | releases/${VER}（用户态 + kmod 均可用）|\"\n  echo \"| 兼容自检 | \\`$PROBE\\` |\"\n  echo \"| 固件 | \\`$ITB\\` |\"\n  echo\n  echo \"### 附件\"\n  echo \"- \\`*.itb\\` 固件；\\`*.manifest\\` 包清单；\\`sha256sums\\`\"\n  echo \"- \\`official-kernel-config.tar.gz\\`：本版实际使用的内核配置 / .vermagic / 校验信息（可复现）\"\n  echo \"- \\`kmod_probe.txt\\`：官方 kmod 兼容性自检结果\"\n  echo \"- \\`rax3000m-256m-offline-packages.tar.gz\\`：离线包仓库（官方源不可达时兜底）\"\n  echo\n  echo \"### 刷入\"\n  echo \"1. \\`nanddump -f /tmp/factory.bin /dev/mtd2\\` 备份\"\n  echo \"2. 250.5MB 布局下系统内 sysupgrade 上传 \\`.itb\\`，**别勾保留配置**\"\n} > \"$GITHUB_WORKSPACE/NOTES.md\"\ncat \"$GITHUB_WORKSPACE/NOTES.md\"\nif [ -d official-kernel-config ]; then tar -czf official-kernel-config.tar.gz official-kernel-config; fi\nmapfile -d '' -t ASSETS < <(find . -maxdepth 1 -type f -print0 | sort -z)\ngh release create \"$TAG\" --repo \"$GITHUB_REPOSITORY\" --title \"RAX3000M 256M · ImmortalWrt ${VER}（官方内核+单设备精简 · 官方 kmod 可直装）\" --notes-file \"$GITHUB_WORKSPACE/NOTES.md\" \"${ASSETS[@]}\""
-    if: always() && !cancelled()
+      run: |-
+        set -e
+        cd firmware
+        VER="${{ inputs.release_tag }}"; VER="${VER#v}"
+        TAG="rax3000m-256m-immortalwrt-${VER}-official-lean-$(date -u +%Y%m%d-%H%M)"
+        ITB=$(ls *cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)
+        PROBE=$(cat kmod_probe.txt 2>/dev/null || echo "kmod_compat=UNKNOWN")
+        {
+          echo "## RAX3000M NAND 256M · ImmortalWrt **${VER}**「官方内核 + 单设备精简包」"
+          echo
+          echo "做法：\`.config\` 用官方 config 生成过一次**官方内核配置**（hash 复现校验通过），"
+          echo "然后**只编 rax3000m 一台设备**，并把内核配置钉成官方那份 →"
+          echo "**官方 release 源的 kmod-\* 可直接 apk add**，同时固件比官方版更精简。"
+          echo
+          echo "| 项 | 值 |"
+          echo "|---|---|"
+          echo "| 源码 | immortalwrt @ tag **${{ inputs.release_tag }}**（feeds 按 commit 锁定）|"
+          echo "| 内核配置 | 官方 config 复现（md5 = \`${{ inputs.expected_khash }}\`）|"
+          echo "| 设备 | **只编 \`cmcc_rax3000m\`**（单设备，不是全 subtarget）|"
+          echo "| 唯一源码改动 | ubi 114M → **250.5MB** |"
+          echo "| 版本 | \`${VER}\` |"
+          echo "| apk 源 | releases/${VER}（用户态 + kmod 均可用）|"
+          echo "| 兼容自检 | \`$PROBE\` |"
+          echo "| 固件 | \`$ITB\` |"
+          echo
+          echo "### 附件"
+          echo "- \`*.itb\` 固件；\`*.manifest\` 包清单；\`sha256sums\`"
+          echo "- \`official-kernel-config.tar.gz\`：本版实际使用的内核配置 / .vermagic / 校验信息（可复现）"
+          echo "- \`kmod_probe.txt\`：官方 kmod 兼容性自检结果"
+          echo "- \`rax3000m-256m-offline-packages.tar.gz\`：离线包仓库（官方源不可达时兜底）"
+          echo
+          echo "### 刷入"
+          echo "1. \`nanddump -f /tmp/factory.bin /dev/mtd2\` 备份"
+          echo "2. 250.5MB 布局下系统内 sysupgrade 上传 \`.itb\`，**别勾保留配置**"
+        } > "$GITHUB_WORKSPACE/NOTES.md"
+        cat "$GITHUB_WORKSPACE/NOTES.md"
+        if [ -d official-kernel-config ]; then tar -czf official-kernel-config.tar.gz official-kernel-config; fi
+        mapfile -d '' -t ASSETS < <(find . -maxdepth 1 -type f -print0 | sort -z)
+        gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "RAX3000M 256M · ImmortalWrt ${VER}（官方内核+单设备精简 · 官方 kmod 可直装）" --notes-file "$GITHUB_WORKSPACE/NOTES.md" "${ASSETS[@]}"
+    if: always() && !cancelled() && needs.preflight.result == 'success'
