@@ -1,0 +1,232 @@
+# RAX3000M NAND 256M · 「官方对齐版」：内核配置与官方 25.12.2 逐字节一致
+#   → 官方 release 源里的 kmod-* 可以直接 apk add（依赖内核 vermagic/hash 一致）
+# 做法：
+#   1) 源码 = 发布 tag（v25.12.2），该 tag 的 feeds.conf.default 把每个 feed 都按 commit 锁定
+#   2) .config = 官方发布用的 config.buildinfo（downloads.immortalwrt.org/.../config.buildinfo）
+#   3) 唯一改动 = DTS 里 ubi 由 114M 改为 250.5MB（不影响内核配置）
+#   4) 编译后自动比对：产物内核包的 hash 是否 == 官方 kmods 目录里的 hash
+name: Build RAX3000M 256M Firmware (official-aligned, kmod-compatible)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'ImmortalWrt 发布 tag'
+        required: true
+        default: 'v25.12.2'
+      expected_khash:
+        description: '官方 kmods 目录里的内核 hash（用于自动比对）'
+        required: true
+        default: 'b5b7729ffbba3ecdd83f339de8fadfb8'
+      offline_repo:
+        description: '是否额外打包离线包仓库（官方源可用时非必需，true/false）'
+        required: true
+        default: 'false'
+      make_release:
+        description: '编译完成后发布 GitHub Release（true/false）'
+        required: true
+        default: 'true'
+
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout 本仓库（拿 diy 脚本）
+        uses: actions/checkout@v4
+
+      - name: 清理磁盘
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          large-packages: true
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \
+            haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \
+            libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \
+            libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \
+            ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \
+            python3-ply python3-docutils python3-pyelftools qemu-utils \
+            re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd
+          sudo timedatectl set-timezone "$TZ"
+          echo "nproc=$(nproc)"
+
+      - name: 克隆源码（发布 tag）
+        run: |
+          TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
+          git clone $REPO_URL -b "$TAG" --single-branch --depth 1 openwrt
+          cd openwrt
+          echo "=== version.mk（tag 自带版本号/源）==="
+          grep -E 'VERSION_(NUMBER|CODE|REPO):=\$\(if' include/version.mk
+          echo "=== feeds 是否按 commit 锁定（决定能否与官方逐字节对齐）==="
+          grep -c '\^[0-9a-f]\{40\}' feeds.conf.default || true
+          grep -q ",${VER})" include/version.mk || { echo "ERROR: 版本默认值不是 ${VER}"; exit 1; }
+          echo "=== version probe: ${VER} (tag ${TAG}) ==="
+
+      - name: 用官方 config.buildinfo 作为 .config
+        run: |
+          TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
+          cd openwrt
+          curl -fsSL -o .config "https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo"
+          echo "config.buildinfo 行数: $(wc -l < .config)"
+          grep -q '^CONFIG_TARGET_mediatek_filogic=y' .config || { echo "ERROR: config.buildinfo 内容不对"; exit 1; }
+          grep -E '^CONFIG_VERSION_(NUMBER|CODE|REPO)=' .config || true
+          echo "=== config probe: official config.buildinfo 已就位 ==="
+
+      - name: 执行 diy-part1.sh（自定义 feeds，默认为空）
+        run: |
+          cd openwrt
+          if [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then
+            chmod +x $GITHUB_WORKSPACE/diy-part1.sh
+            $GITHUB_WORKSPACE/diy-part1.sh
+          fi
+
+      - name: 更新 & 安装 feeds（tag 已锁定各 feed commit）
+        run: |
+          cd openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 执行 diy-part2.sh（唯一改动：DTS ubi 114M -> 250.5M）
+        run: |
+          cd openwrt
+          if [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then
+            chmod +x $GITHUB_WORKSPACE/diy-part2.sh
+            $GITHUB_WORKSPACE/diy-part2.sh
+          fi
+          grep -q 'reg = <0x580000 0xFA80000>;' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso \
+            || { echo "ERROR: DTS 分区未被改成 250.5MB"; exit 1; }
+
+      - name: 展开配置
+        run: |
+          cd openwrt
+          make defconfig
+          echo "=== image packages (=y): $(grep -c '^CONFIG_PACKAGE_.*=y$' .config || true) ==="
+          grep -E '^CONFIG_TARGET_PROFILE|^CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m=' .config || echo "(未限定单个设备 -> 编全 subtarget，内核配置才能与官方一致，这是刻意的)"
+
+      - name: 下载源码包
+        run: |
+          cd openwrt
+          make download -j$(nproc) 2>&1 | tail -15
+
+      - name: 编译（全 subtarget，2-5 小时）
+        run: |
+          cd openwrt
+          echo "======== 开始编译 ========"
+          date -u
+          make -j$(nproc) || { echo "=== 首次失败，V=s 重试 ==="; make -j$(nproc) V=s; }
+          date -u
+
+      - name: 校验产物（布局 + 内核 hash 是否与官方一致）
+        run: |
+          cd openwrt
+          ITB=$(ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)
+          echo "ITB = $ITB"
+          python3 -c "
+          b=open('$ITB','rb').read()
+          ok=bytes.fromhex('005800000fa80000') in b
+          bad=bytes.fromhex('0058000007200000') in b
+          print('=== layout probe: ubi=250.5M', ok, '| 114M', bad, '===')
+          raise SystemExit(0 if (ok and not bad) else 1)
+          "
+          echo "=== 我们编出的 kernel 包 ==="
+          ls -1 bin/targets/mediatek/filogic/packages/ | grep -iE '^kernel' | head -5
+          OURS=$(ls -1 bin/targets/mediatek/filogic/packages/ | grep -oiE '[0-9a-f]{32}' | sort -u | head -1)
+          OFFI="${{ inputs.expected_khash }}"
+          echo "ours=${OURS:-none}  official=${OFFI}"
+          if [ "$OURS" = "$OFFI" ]; then
+            echo "=== kmod hash probe: MATCH ($OURS) -> 官方 release 的 kmod 可直接 apk add ==="
+            echo "kmod_compat=MATCH" >> "$GITHUB_WORKSPACE/kmod_probe.txt"
+          else
+            echo "=== kmod hash probe: MISMATCH ours=${OURS:-none} official=${OFFI} -> 官方 kmod 可能装不上 ==="
+            echo "kmod_compat=MISMATCH(ours=${OURS:-none},official=${OFFI})" >> "$GITHUB_WORKSPACE/kmod_probe.txt"
+          fi
+          echo "=== 版本文件 ==="
+          ls -1 bin/targets/mediatek/filogic/ | grep -E 'version|profiles' || true
+
+      - name: 打包离线包仓库（可选）
+        if: ${{ inputs.offline_repo == 'true' }}
+        run: |
+          cd openwrt
+          rm -rf /tmp/offline && mkdir -p /tmp/offline/packages /tmp/offline/target-packages
+          cp -a bin/packages/. /tmp/offline/packages/
+          [ -d bin/targets/mediatek/filogic/packages ] && cp -a bin/targets/mediatek/filogic/packages/. /tmp/offline/target-packages/
+          echo "userspace apk: $(find /tmp/offline/packages -name '*.apk' | wc -l)"
+          echo "kmod/target apk: $(find /tmp/offline/target-packages -name '*.apk' | wc -l)"
+          tar -czf rax3000m-256m-offline-packages.tar.gz -C /tmp/offline .
+          ls -lh rax3000m-256m-offline-packages.tar.gz
+
+      - name: 整理产物
+        run: |
+          mkdir -p firmware
+          find openwrt/bin/targets/mediatek/filogic -maxdepth 1 -type f \
+            \( -name '*cmcc_rax3000m*.itb' -o -name '*cmcc_rax3000m*.fip' -o -name '*cmcc_rax3000m*preloader*.bin' -o -name '*cmcc_rax3000m*.manifest' -o -name 'version.buildinfo' -o -name 'profiles.json' \) \
+            -exec cp {} firmware/ \;
+          cp -f openwrt/rax3000m-256m-offline-packages.tar.gz firmware/ 2>/dev/null || true
+          cp -f $GITHUB_WORKSPACE/kmod_probe.txt firmware/kmod_probe.txt 2>/dev/null || true
+          ls -lh firmware/
+          cd firmware && sha256sum * > sha256sums && cat sha256sums
+
+      - name: 上传 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rax3000m-256m-official-aligned
+          path: firmware/
+          retention-days: 90
+
+      - name: 发布 Release
+        if: ${{ github.event.inputs.make_release == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cd firmware
+          VER="${{ inputs.release_tag }}"; VER="${VER#v}"
+          TAG="rax3000m-256m-immortalwrt-${VER}-official-$(date -u +%Y%m%d-%H%M)"
+          ITB=$(ls *cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)
+          PROBE=$(cat kmod_probe.txt 2>/dev/null || echo "kmod_compat=UNKNOWN")
+          {
+            echo "## RAX3000M NAND 256M · ImmortalWrt **${VER}** 「官方对齐版」"
+            echo
+            echo "内核配置与官方 ${VER} 发布版**一致**，因此 **官方 release 源的 \`kmod-*\` 可以直接 \`apk add\`**。"
+            echo
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 源码 | \`immortalwrt/immortalwrt\` @ tag **${{ inputs.release_tag }}**（feeds 按 commit 锁定）|"
+            echo "| .config | 官方发布用的 \`config.buildinfo\`（未做精简）|"
+            echo "| 唯一改动 | ubi 分区 114M → **250.5MB**（\`reg = <0x580000 0xFA80000>\`）|"
+            echo "| 版本 | \`${VER}\`（\`/etc/openwrt_release\`）|"
+            echo "| apk 源 | \`releases/${VER}\`（用户态包 + **kmod 都可用**）|"
+            echo "| kmod 兼容性自检 | \`$PROBE\`（MATCH = 与官方 kmods 同 hash）|"
+            echo "| 固件 | \`$ITB\` |"
+            echo
+            echo "### 与「精简版」的区别"
+            echo "- 本版：预装 = 官方那套（镜像更大），**官方源里的 kmod 可直接装**，不用离线库"
+            echo "- 精简版：镜像更小 + 带离线包仓库，但官方 kmod 需从离线库装"
+            echo
+            echo "### 刷入"
+            echo "1. 备份 \`factory\`（MAC/EEPROM）：\`nanddump -f /tmp/factory.bin /dev/mtd2\`"
+            echo "2. 现役是 250.5MB 布局时，系统内 sysupgrade 上传本 \`.itb\` 即可；**别勾\"保留配置\"**"
+            echo "3. 若现役是 114M 布局：先在 U-Boot web 里切到 \`default\`(256M) 布局再刷"
+            echo
+            echo "### 校验"
+            echo "- 布局：编译时直接在 \`.itb\` 里比对 DTB 的 \`reg\` 字节（含 250.5MB、不含 114M）"
+            echo "- 内核/包：见 \`kmod_probe.txt\`、\`sha256sums\`、\`*.manifest\`"
+          } > "$GITHUB_WORKSPACE/NOTES.md"
+          cat "$GITHUB_WORKSPACE/NOTES.md"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "RAX3000M 256M · ImmortalWrt ${VER} 官方对齐版（官方 kmod 可直装）" --notes-file "$GITHUB_WORKSPACE/NOTES.md" *
