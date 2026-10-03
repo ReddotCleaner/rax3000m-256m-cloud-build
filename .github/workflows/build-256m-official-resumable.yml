@@ -1,0 +1,337 @@
+name: Build RAX3000M 256M Firmware (official-aligned, resumable)
+'on':
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: ImmortalWrt 发布 tag
+        required: true
+        default: v25.12.2
+      expected_khash:
+        description: 官方 kmods 内核 hash（用于比对）
+        required: true
+        default: b5b7729ffbba3ecdd83f339de8fadfb8
+      cache_gen:
+        description: 缓存代号（改了 config/diy 就换成新值，避免用旧缓存）
+        required: true
+        default: g1
+      make_release:
+        description: 发布 Release（true/false）
+        required: true
+        default: 'true'
+env:
+  REPO_URL: https://github.com/immortalwrt/immortalwrt.git
+  TZ: Asia/Shanghai
+jobs:
+  stage1:
+    name: 阶段 1（编译，预算 16200）
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    outputs:
+      done: ${{ steps.check.outputs.done }}
+    steps:
+    - name: Checkout 本仓库
+      uses: actions/checkout@v4
+    - name: 清理磁盘
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        large-packages: true
+    - name: 安装编译依赖
+      run: "sudo apt-get update -qq\nsudo apt-get install -y --no-install-recommends \\\n  ack antlr3 asciidoc autoconf automake autopoint binutils bison \\\n  build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \\\n  fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \\\n  haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \\\n  libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \\\n  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \\\n  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \\\n  python3-ply python3-docutils python3-pyelftools qemu-utils \\\n  re2c rsync scons squashfs-tools subversion swig texinfo \\\n  uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd\nsudo timedatectl set-timezone \"$TZ\"\necho \"nproc=$(nproc)\""
+    - name: 恢复构建缓存（staging_dir + build_dir）
+      uses: actions/cache@v4
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-s1
+        restore-keys: 'owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-
+
+          '
+    - name: 准备源码/配置/feeds/DTS
+      run: 'TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
+
+        git clone $REPO_URL -b "$TAG" --single-branch --depth 1 openwrt
+
+        cd openwrt
+
+        curl -fsSL -o .config "https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo"
+
+        grep -q ''^CONFIG_TARGET_mediatek_filogic=y'' .config || { echo "ERROR: config.buildinfo 不对"; exit 1; }
+
+        if [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part1.sh; $GITHUB_WORKSPACE/diy-part1.sh; fi
+
+        ./scripts/feeds update -a
+
+        ./scripts/feeds install -a
+
+        if [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part2.sh; $GITHUB_WORKSPACE/diy-part2.sh; fi
+
+        grep -q ''reg = <0x580000 0xFA80000>;'' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo "ERROR: DTS 未改成 250.5MB"; exit 1; }
+
+        make defconfig
+
+        echo "=== image packages (=y): $(grep -c ''^CONFIG_PACKAGE_.*=y$'' .config || true) ==="
+
+        make download -j$(nproc) 2>&1 | tail -5
+
+        echo "=== prep done ==="
+
+        '
+    - name: 编译（timeout 16200 后收工保存缓存，下次续跑）
+      run: "cd openwrt\nset +e\ntimeout 16200 make -j$(nproc)\nRC=$?\nset -e\necho \"=== make 退出码 $RC（124=到点收工，正常；0=编完）===\"\n# 产物出现即视为编完\nif ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb >/dev/null 2>&1; then\n  echo \"=== 阶段完成：已产出固件 ===\"\nelse\n  echo \"=== 本阶段未编完，缓存已保存，下一阶段接着编 ===\"\nfi"
+    - name: 记录是否编完
+      id: check
+      run: "cd openwrt\nif ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb >/dev/null 2>&1; then\n  echo \"done=true\" >> \"$GITHUB_OUTPUT\"\nelse\n  echo \"done=false\" >> \"$GITHUB_OUTPUT\"\nfi"
+    - name: 保存构建缓存
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-s1
+  stage2:
+    name: 阶段 2（编译，预算 16200）
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    outputs:
+      done: ${{ steps.check.outputs.done }}
+    steps:
+    - name: Checkout 本仓库
+      uses: actions/checkout@v4
+    - name: 清理磁盘
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        large-packages: true
+    - name: 安装编译依赖
+      run: "sudo apt-get update -qq\nsudo apt-get install -y --no-install-recommends \\\n  ack antlr3 asciidoc autoconf automake autopoint binutils bison \\\n  build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \\\n  fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \\\n  haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \\\n  libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \\\n  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \\\n  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \\\n  python3-ply python3-docutils python3-pyelftools qemu-utils \\\n  re2c rsync scons squashfs-tools subversion swig texinfo \\\n  uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd\nsudo timedatectl set-timezone \"$TZ\"\necho \"nproc=$(nproc)\""
+    - name: 恢复构建缓存（staging_dir + build_dir）
+      uses: actions/cache@v4
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-s2
+        restore-keys: 'owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-
+
+          '
+    - name: 准备源码/配置/feeds/DTS
+      run: 'TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
+
+        git clone $REPO_URL -b "$TAG" --single-branch --depth 1 openwrt
+
+        cd openwrt
+
+        curl -fsSL -o .config "https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo"
+
+        grep -q ''^CONFIG_TARGET_mediatek_filogic=y'' .config || { echo "ERROR: config.buildinfo 不对"; exit 1; }
+
+        if [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part1.sh; $GITHUB_WORKSPACE/diy-part1.sh; fi
+
+        ./scripts/feeds update -a
+
+        ./scripts/feeds install -a
+
+        if [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part2.sh; $GITHUB_WORKSPACE/diy-part2.sh; fi
+
+        grep -q ''reg = <0x580000 0xFA80000>;'' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo "ERROR: DTS 未改成 250.5MB"; exit 1; }
+
+        make defconfig
+
+        echo "=== image packages (=y): $(grep -c ''^CONFIG_PACKAGE_.*=y$'' .config || true) ==="
+
+        make download -j$(nproc) 2>&1 | tail -5
+
+        echo "=== prep done ==="
+
+        '
+    - name: 编译（timeout 16200 后收工保存缓存，下次续跑）
+      run: "cd openwrt\nset +e\ntimeout 16200 make -j$(nproc)\nRC=$?\nset -e\necho \"=== make 退出码 $RC（124=到点收工，正常；0=编完）===\"\n# 产物出现即视为编完\nif ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb >/dev/null 2>&1; then\n  echo \"=== 阶段完成：已产出固件 ===\"\nelse\n  echo \"=== 本阶段未编完，缓存已保存，下一阶段接着编 ===\"\nfi"
+    - name: 记录是否编完
+      id: check
+      run: "cd openwrt\nif ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb >/dev/null 2>&1; then\n  echo \"done=true\" >> \"$GITHUB_OUTPUT\"\nelse\n  echo \"done=false\" >> \"$GITHUB_OUTPUT\"\nfi"
+    - name: 保存构建缓存
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-s2
+    needs:
+    - stage1
+    if: always() && !cancelled() && needs.stage1.outputs.done != 'true'
+  stage3:
+    name: 阶段 3（编译，预算 16200）
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    outputs:
+      done: ${{ steps.check.outputs.done }}
+    steps:
+    - name: Checkout 本仓库
+      uses: actions/checkout@v4
+    - name: 清理磁盘
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        large-packages: true
+    - name: 安装编译依赖
+      run: "sudo apt-get update -qq\nsudo apt-get install -y --no-install-recommends \\\n  ack antlr3 asciidoc autoconf automake autopoint binutils bison \\\n  build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \\\n  fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \\\n  haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \\\n  libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \\\n  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \\\n  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \\\n  python3-ply python3-docutils python3-pyelftools qemu-utils \\\n  re2c rsync scons squashfs-tools subversion swig texinfo \\\n  uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd\nsudo timedatectl set-timezone \"$TZ\"\necho \"nproc=$(nproc)\""
+    - name: 恢复构建缓存（staging_dir + build_dir）
+      uses: actions/cache@v4
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-s3
+        restore-keys: 'owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-
+
+          '
+    - name: 准备源码/配置/feeds/DTS
+      run: 'TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
+
+        git clone $REPO_URL -b "$TAG" --single-branch --depth 1 openwrt
+
+        cd openwrt
+
+        curl -fsSL -o .config "https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo"
+
+        grep -q ''^CONFIG_TARGET_mediatek_filogic=y'' .config || { echo "ERROR: config.buildinfo 不对"; exit 1; }
+
+        if [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part1.sh; $GITHUB_WORKSPACE/diy-part1.sh; fi
+
+        ./scripts/feeds update -a
+
+        ./scripts/feeds install -a
+
+        if [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part2.sh; $GITHUB_WORKSPACE/diy-part2.sh; fi
+
+        grep -q ''reg = <0x580000 0xFA80000>;'' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo "ERROR: DTS 未改成 250.5MB"; exit 1; }
+
+        make defconfig
+
+        echo "=== image packages (=y): $(grep -c ''^CONFIG_PACKAGE_.*=y$'' .config || true) ==="
+
+        make download -j$(nproc) 2>&1 | tail -5
+
+        echo "=== prep done ==="
+
+        '
+    - name: 编译（timeout 16200 后收工保存缓存，下次续跑）
+      run: "cd openwrt\nset +e\ntimeout 16200 make -j$(nproc)\nRC=$?\nset -e\necho \"=== make 退出码 $RC（124=到点收工，正常；0=编完）===\"\n# 产物出现即视为编完\nif ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb >/dev/null 2>&1; then\n  echo \"=== 阶段完成：已产出固件 ===\"\nelse\n  echo \"=== 本阶段未编完，缓存已保存，下一阶段接着编 ===\"\nfi"
+    - name: 记录是否编完
+      id: check
+      run: "cd openwrt\nif ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb >/dev/null 2>&1; then\n  echo \"done=true\" >> \"$GITHUB_OUTPUT\"\nelse\n  echo \"done=false\" >> \"$GITHUB_OUTPUT\"\nfi"
+    - name: 保存构建缓存
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-s3
+    needs:
+    - stage2
+    if: always() && !cancelled() && needs.stage2.outputs.done != 'true'
+  finish:
+    name: 收尾（补完剩余 + 校验 + 发 Release）
+    needs:
+    - stage1
+    - stage2
+    - stage3
+    if: always() && !cancelled()
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    permissions:
+      contents: write
+    steps:
+    - name: Checkout 本仓库
+      uses: actions/checkout@v4
+    - name: 清理磁盘
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: true
+        android: true
+        dotnet: true
+        large-packages: true
+    - name: 安装编译依赖
+      run: "sudo apt-get update -qq\nsudo apt-get install -y --no-install-recommends \\\n  ack antlr3 asciidoc autoconf automake autopoint binutils bison \\\n  build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \\\n  fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \\\n  haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \\\n  libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \\\n  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \\\n  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \\\n  python3-ply python3-docutils python3-pyelftools qemu-utils \\\n  re2c rsync scons squashfs-tools subversion swig texinfo \\\n  uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd\nsudo timedatectl set-timezone \"$TZ\"\necho \"nproc=$(nproc)\""
+    - name: 恢复构建缓存
+      uses: actions/cache@v4
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-finish
+        restore-keys: owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-
+    - name: 准备源码/配置/feeds/DTS
+      run: 'TAG="${{ inputs.release_tag }}"; VER="${TAG#v}"
+
+        git clone $REPO_URL -b "$TAG" --single-branch --depth 1 openwrt
+
+        cd openwrt
+
+        curl -fsSL -o .config "https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo"
+
+        grep -q ''^CONFIG_TARGET_mediatek_filogic=y'' .config || { echo "ERROR: config.buildinfo 不对"; exit 1; }
+
+        if [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part1.sh; $GITHUB_WORKSPACE/diy-part1.sh; fi
+
+        ./scripts/feeds update -a
+
+        ./scripts/feeds install -a
+
+        if [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part2.sh; $GITHUB_WORKSPACE/diy-part2.sh; fi
+
+        grep -q ''reg = <0x580000 0xFA80000>;'' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo "ERROR: DTS 未改成 250.5MB"; exit 1; }
+
+        make defconfig
+
+        echo "=== image packages (=y): $(grep -c ''^CONFIG_PACKAGE_.*=y$'' .config || true) ==="
+
+        make download -j$(nproc) 2>&1 | tail -5
+
+        echo "=== prep done ==="
+
+        '
+    - name: 补完编译
+      run: 'cd openwrt
+
+        make -j$(nproc) || make -j1 V=s'
+    - name: 校验（布局 + 官方 kmod hash）
+      run: "cd openwrt\nITB=$(ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)\necho \"ITB = $ITB\"\npython3 -c \"\nb=open('$ITB','rb').read()\nok=bytes.fromhex('005800000fa80000') in b\nbad=bytes.fromhex('0058000007200000') in b\nprint('=== layout probe: ubi=250.5M', ok, '| 114M', bad, '===')\nraise SystemExit(0 if (ok and not bad) else 1)\n\"\necho \"=== 我们编出的 kernel 包 ===\"\nls -1 bin/targets/mediatek/filogic/packages/ | grep -iE '^kernel' | head -5\nOURS=$(ls -1 bin/targets/mediatek/filogic/packages/ | grep -oiE '[0-9a-f]{32}' | sort -u | head -1)\nOFFI=\"${{ inputs.expected_khash }}\"\necho \"ours=${OURS:-none}  official=${OFFI}\"\nif [ \"$OURS\" = \"$OFFI\" ]; then\n  echo \"=== kmod hash probe: MATCH ($OURS) -> 官方 release 的 kmod 可直接 apk add ===\"\n  echo \"kmod_compat=MATCH\" >> \"$GITHUB_WORKSPACE/kmod_probe.txt\"\nelse\n  echo \"=== kmod hash probe: MISMATCH ours=${OURS:-none} official=${OFFI} ===\"\n  echo \"kmod_compat=MISMATCH(ours=${OURS:-none},official=${OFFI})\" >> \"$GITHUB_WORKSPACE/kmod_probe.txt\"\nfi"
+    - name: 整理产物
+      run: "mkdir -p firmware\nfind openwrt/bin/targets/mediatek/filogic -maxdepth 1 -type f \\\n  \\( -name '*cmcc_rax3000m*.itb' -o -name '*cmcc_rax3000m*.fip' -o -name '*cmcc_rax3000m*preloader*.bin' -o -name '*cmcc_rax3000m*.manifest' -o -name 'version.buildinfo' -o -name 'profiles.json' \\) \\\n  -exec cp {} firmware/ \\;\ncp -f $GITHUB_WORKSPACE/kmod_probe.txt firmware/kmod_probe.txt 2>/dev/null || true\nls -lh firmware/\ncd firmware && sha256sum * > sha256sums && cat sha256sums"
+    - name: 上传 Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rax3000m-256m-official-aligned
+        path: firmware/
+        retention-days: 90
+    - name: 发布 Release
+      if: ${{ inputs.make_release == 'true' }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: "set -e\ncd firmware\nVER=\"${{ inputs.release_tag }}\"; VER=\"${VER#v}\"\nTAG=\"rax3000m-256m-immortalwrt-${VER}-official-$(date -u +%Y%m%d-%H%M)\"\nITB=$(ls *cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)\nPROBE=$(cat kmod_probe.txt 2>/dev/null || echo \"kmod_compat=UNKNOWN\")\n{\n  echo \"## RAX3000M NAND 256M · ImmortalWrt **${VER}** 「官方对齐版」（分阶段续编）\"\n  echo\n  echo \"内核配置与官方 ${VER} 一致 → **官方 release 源的 kmod-* 可直接 apk add**。\"\n  echo\n  echo \"| 项 | 值 |\"\n  echo \"|---|---|\"\n  echo \"| 源码 | immortalwrt @ tag **${{ inputs.release_tag }}**（feeds 按 commit 锁定）|\"\n  echo \"| .config | 官方 config.buildinfo（未精简）|\"\n  echo \"| 唯一改动 | ubi 114M → **250.5MB** |\"\n  echo \"| 版本 | \\`${VER}\\` |\"\n  echo \"| apk 源 | releases/${VER}（用户态包 + kmod 都可用）|\"\n  echo \"| kmod 自检 | \\`$PROBE\\`（MATCH = 与官方 kmods 同 hash）|\"\n  echo \"| 固件 | \\`$ITB\\` |\"\n  echo\n  echo \"### 刷入\"\n  echo \"1. 备份 factory：\\`nanddump -f /tmp/factory.bin /dev/mtd2\\`\"\n  echo \"2. 现役 250.5MB 布局 → 系统内 sysupgrade 上传本 .itb；**别勾保留配置**\"\n  echo\n  echo \"### 说明\"\n  echo \"- 本版工作量约 8 小时，GitHub 单 job 上限 6 小时 → 已改成分阶段编译（每阶段 4.5 小时 + 缓存续跑），缓存键：\\`owrt-aligned-${{ inputs.release_tag }}-${{ inputs.cache_gen }}-*\\`\"\n} > \"$GITHUB_WORKSPACE/NOTES.md\"\ncat \"$GITHUB_WORKSPACE/NOTES.md\"\ngh release create \"$TAG\" --repo \"$GITHUB_REPOSITORY\" --title \"RAX3000M 256M · ImmortalWrt ${VER} 官方对齐版（官方 kmod 可直装）\" --notes-file \"$GITHUB_WORKSPACE/NOTES.md\" *"
