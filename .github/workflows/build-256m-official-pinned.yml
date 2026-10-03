@@ -109,6 +109,16 @@ jobs:
     - *id002
     - name: 安装编译依赖
       run: "sudo apt-get update -qq\nsudo apt-get install -y --no-install-recommends \\\n  ack antlr3 asciidoc autoconf automake autopoint binutils bison \\\n  build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \\\n  fastjar flex gawk gcc-multilib g++-multilib git gnutls-dev gperf \\\n  haveged help2man intltool libncurses-dev libelf-dev libglib2.0-dev \\\n  libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libreadline-dev \\\n  libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz nano \\\n  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip \\\n  python3-ply python3-docutils python3-pyelftools qemu-utils \\\n  re2c rsync scons squashfs-tools subversion swig texinfo \\\n  uglifyjs unzip vim wget xmlto xxd zlib1g-dev zstd\nsudo timedatectl set-timezone \"$TZ\"\necho \"nproc=$(nproc)\""
+    - name: 恢复构建缓存（重跑可续）
+      uses: actions/cache@v4
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-pinned-${{ inputs.release_tag }}-g1
+        restore-keys: owrt-pinned-${{ inputs.release_tag }}-
     - name: 克隆 tag（官方 config 为底，随后收敛为单设备）
       run: "TAG=\"${{ inputs.release_tag }}\"; VER=\"${TAG#v}\"\ngit clone $REPO_URL -b \"$TAG\" --single-branch --depth 1 openwrt\ncd openwrt\ncurl -fsSL -o .config \"https://downloads.immortalwrt.org/releases/${VER}/targets/mediatek/filogic/config.buildinfo\"\n# ---- 收敛为单台设备（只编 cmcc_rax3000m）----\nsed -i 's/^CONFIG_TARGET_ALL_PROFILES=y/# CONFIG_TARGET_ALL_PROFILES is not set/' .config || true\n{\n  echo '# CONFIG_TARGET_ALL_PROFILES is not set'\n  echo 'CONFIG_TARGET_PROFILE=\"DEVICE_cmcc_rax3000m\"'\n  echo 'CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_rax3000m=y'\n} >> .config\nif [ -f $GITHUB_WORKSPACE/diy-part1.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part1.sh; $GITHUB_WORKSPACE/diy-part1.sh; fi\n./scripts/feeds update -a\n./scripts/feeds install -a\nif [ -f $GITHUB_WORKSPACE/diy-part2.sh ]; then chmod +x $GITHUB_WORKSPACE/diy-part2.sh; $GITHUB_WORKSPACE/diy-part2.sh; fi\ngrep -q 'reg = <0x580000 0xFA80000>;' target/linux/mediatek/dts/mt7981b-cmcc-rax3000m-nand.dtso || { echo \"ERROR: DTS 未改\"; exit 1; }\nmake defconfig\necho \"=== 单设备确认 ===\"\ngrep -E '^CONFIG_TARGET_(ALL_PROFILES|PROFILE)|DEVICE_cmcc_rax3000m=y' .config\necho \"=== image packages (=y): $(grep -c '^CONFIG_PACKAGE_.*=y$' .config || true) ===\"\nmake download -j$(nproc) 2>&1 | tail -3"
     - name: 编 tools + toolchain
@@ -189,6 +199,16 @@ jobs:
         cat "$LINDIR/.vermagic"; echo
 
         ls -lh bin/targets/mediatek/filogic/*cmcc_rax3000m*.itb 2>/dev/null || echo "（没出 itb）" '
+    - name: 保存构建缓存
+      uses: actions/cache/save@v4
+      continue-on-error: true
+      with:
+        path: 'openwrt/staging_dir
+
+          openwrt/build_dir
+
+          openwrt/bin'
+        key: owrt-pinned-${{ inputs.release_tag }}-g2-${{ github.run_id }}
     - name: 校验（布局 + 我们的 kernel 包 hash vs 官方）
       run: "cd openwrt\nITB=$(ls bin/targets/mediatek/filogic/*cmcc_rax3000m-squashfs-sysupgrade.itb | head -1)\necho \"ITB = $ITB\"\npython3 -c \"\nb=open('$ITB','rb').read()\nok=bytes.fromhex('005800000fa80000') in b\nbad=bytes.fromhex('0058000007200000') in b\nprint('=== layout probe: ubi=250.5M', ok, '| 114M', bad, '===')\nraise SystemExit(0 if (ok and not bad) else 1)\n\"\necho \"=== 我们编出的 kernel 包 ===\"\nls -1 bin/targets/mediatek/filogic/packages/ | grep -iE '^kernel' | head -5\nOURS=$(ls -1 bin/targets/mediatek/filogic/packages/ | grep -oiE '[0-9a-f]{32}' | sort -u | head -1)\nOFFI=\"${{ inputs.expected_khash }}\"\necho \"ours=${OURS:-none} official=${OFFI}\"\nif [ \"$OURS\" = \"$OFFI\" ]; then\n  echo \"=== kmod hash probe: MATCH ($OURS) -> 官方 release 的 kmod 可直接 apk add ✅ ===\"\n  echo \"kmod_compat=MATCH\" >> \"$GITHUB_WORKSPACE/kmod_probe.txt\"\nelse\n  echo \"=== kmod hash probe: MISMATCH ours=${OURS:-none} official=${OFFI} ===\"\n  echo \"kmod_compat=MISMATCH(ours=${OURS:-none},official=${OFFI})\" >> \"$GITHUB_WORKSPACE/kmod_probe.txt\"\nfi\necho \"=== kmod 包数量（应为官方 kmods 目录可补的形态）===\"\nls -1 bin/targets/mediatek/filogic/packages/ | grep -c '^kmod-' || true"
     - name: 打包离线包仓库（稳妥起见）
@@ -206,7 +226,7 @@ jobs:
 
         tar -czf rax3000m-256m-offline-packages.tar.gz -C /tmp/offline . 2>/dev/null; ls -lh rax3000m-256m-offline-packages.tar.gz || true'
     - name: 整理产物
-      run: "mkdir -p firmware\nfind openwrt/bin/targets/mediatek/filogic -maxdepth 1 -type f \\\n  \\( -name '*cmcc_rax3000m*.itb' -o -name '*cmcc_rax3000m*.fip' -o -name '*cmcc_rax3000m*preloader*.bin' -o -name '*cmcc_rax3000m*.manifest' -o -name 'version.buildinfo' -o -name 'profiles.json' \\) \\\n  -exec cp {} firmware/ \\;\ncp -f openwrt/rax3000m-256m-offline-packages.tar.gz firmware/ 2>/dev/null || true\ncp -f $GITHUB_WORKSPACE/kmod_probe.txt firmware/kmod_probe.txt 2>/dev/null || true\nmkdir -p firmware/official-kernel-config && cp -f /tmp/kcfg/* firmware/official-kernel-config/ 2>/dev/null || true\nls -lh firmware/; cd firmware && sha256sum * >/dev/null 2>&1 || true; sha256sum * > sha256sums; cat sha256sums"
+      run: "mkdir -p firmware\nfind openwrt/bin/targets/mediatek/filogic -maxdepth 1 -type f \\\n  \\( -name '*cmcc_rax3000m*.itb' -o -name '*cmcc_rax3000m*.fip' -o -name '*cmcc_rax3000m*preloader*.bin' -o -name '*cmcc_rax3000m*.manifest' -o -name 'version.buildinfo' -o -name 'profiles.json' \\) \\\n  -exec cp {} firmware/ \\;\ncp -f openwrt/rax3000m-256m-offline-packages.tar.gz firmware/ 2>/dev/null || true\ncp -f $GITHUB_WORKSPACE/kmod_probe.txt firmware/kmod_probe.txt 2>/dev/null || true\nmkdir -p firmware/official-kernel-config && cp -f /tmp/kcfg/* firmware/official-kernel-config/ 2>/dev/null || true\nls -lh firmware/\ncd firmware\nfind . -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum > sha256sums   # 只对文件算，目录会报错\ncat sha256sums\nls -1 official-kernel-config/ 2>/dev/null || true"
     - name: 上传 Artifact
       uses: actions/upload-artifact@v4
       with:
