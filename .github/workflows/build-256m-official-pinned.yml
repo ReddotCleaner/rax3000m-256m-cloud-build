@@ -270,10 +270,26 @@ jobs:
         grep -E '^CONFIG_TARGET_(ALL_PROFILES|PROFILE)|DEVICE_cmcc_rax3000m=y' .config
         echo "=== image packages (=y): $(grep -c '^CONFIG_PACKAGE_.*=y$' .config || true) ==="
         make download -j$(nproc) 2>&1 | tail -3
-    - name: 编 tools + toolchain
+    - name: 编 tools + toolchain（可断点续编重试）
       run: |-
         cd openwrt
-        make -j$(nproc) tools/compile toolchain/compile 2>&1 | tail -5
+        # tools+toolchain 用「断点续编」多次重试：网络抖动/并行竞态常导致单次失败，
+        # 但 make 可从断点继续，重跑即恢复（37158934261 的 toolchain/musl 单次失败被 tail 吞掉，教训）
+        tt_ok=0
+        for i in 1 2 3; do
+          echo "=== [tools+toolchain] 第 $i 次尝试 ==="
+          set -o pipefail
+          if timeout 3600 make -j$(nproc) tools/compile toolchain/compile 2>&1 | tee /tmp/tools_toolchain.log | tail -20; then
+            set +o pipefail; tt_ok=1; echo "=== [tools+toolchain] 成功 ==="; break
+          fi
+          set +o pipefail
+          echo "=== [tools+toolchain] 第 $i 次失败，断点续编重试 ==="
+          sleep 10
+        done
+        if [ "$tt_ok" != 1 ]; then
+          echo "=== 警告：tools+toolchain 3 次未成功，关键错误行如下 ==="
+          grep -iE "error|failed to build|No space left|Killed" /tmp/tools_toolchain.log 2>/dev/null | tail -40 || true
+        fi
         # 先让它生成自己的（单设备）内核配置，随后被官方配置覆盖
         timeout 2400 make -j$(nproc) target/linux/prepare V=s 2>&1 | tail -20 || true
         LINDIR=$(ls -d build_dir/target-*/linux-mediatek_filogic/linux-6.12.* 2>/dev/null | head -1)
@@ -288,8 +304,26 @@ jobs:
       if: inputs.use_committed_config != 'true'
     - name: 覆盖单设备内核配置为官方内核配置（关键步骤）
       run: "cd openwrt\nLINDIR=$(cat /tmp/lindir.txt)\necho \"LINUX_DIR=$LINDIR\"\nKC=/tmp/kcfg\nif [ ! -f \"$KC/kernel.config.set\" ]; then KC=\"$GITHUB_WORKSPACE/official-kernel-config\"; fi\necho \"=== 使用的官方内核配置来源: $KC ===\"\nls -l \"$KC\"/\n(grep '=[ym]' \"$KC/kernel.config.set\" | LC_ALL=C sort | md5sum | cut -d' ' -f1) || true\ncp -f \"$KC\"/kernel.config.set \"$LINDIR/.config.set\"\ncp -f \"$KC\"/kernel.config     \"$LINDIR/.config\"\ncp -f \"$KC\"/kernel.config     \"$LINDIR/.config.prev\"\ncp -f \"$KC\"/vermagic          \"$LINDIR/.vermagic\"\n# 让 make 认为「已配置」，不再重新合并内核配置\ntouch \"$LINDIR/.configured\"* \"$LINDIR/.prepared\"* 2>/dev/null || true\ntouch \"$LINDIR/.config\" \"$LINDIR/.config.set\" \"$LINDIR/.vermagic\"\necho \"=== 钉入后的内核 hash ===\"\ngrep '=[ym]' \"$LINDIR/.config.set\" | LC_ALL=C sort | md5sum | cut -d' ' -f1\ncat \"$LINDIR/.vermagic\"; echo\necho \"(期望与官方 ${{ inputs.expected_khash }} 相同)\" "
-    - name: 编译（单设备，预计 1.5-3 小时）
-      run: "cd openwrt\necho \"======== 开始编译 ========\"; date -u\ntimeout 16000 make -j$(nproc) || { echo \"=== 到点或失败，V=s 再试 ===\"; timeout 3000 make -j$(nproc) V=s; }\ndate -u\nLINDIR=$(cat /tmp/lindir.txt)\necho \"=== 编译后内核配置 hash（必须仍等于官方）===\"\ngrep '=[ym]' \"$LINDIR/.config.set\" | LC_ALL=C sort | md5sum | cut -d' ' -f1\ncat \"$LINDIR/.vermagic\"; echo\nls -lh bin/targets/mediatek/filogic/*cmcc_rax3000m*.itb 2>/dev/null || echo \"（没出 itb）\" "
+    - name: 编译（单设备，预计 1.5-3 小时；可断点续编重试）
+      run: |
+        cd openwrt
+        echo "======== 开始编译 ========"; date -u
+        # 去掉原来「先 16000s，失败再 V=s 补 3000s」的写法：第二次只剩 50 分钟且 V=s 极慢，必被 kill 成 exit 124。
+        # 改成同预算内的多次普通重试——OpenWrt 支持断点续编，续跑代价远小于整体重来。
+        build_ok=0
+        for i in 1 2 3; do
+          echo "=== [编译] 第 $i 次尝试（make 可断点续编）==="
+          if timeout 15000 make -j$(nproc); then build_ok=1; echo "=== [编译] 成功（第 $i 次）==="; break; fi
+          echo "=== [编译] 第 $i 次失败，断点续编重试 ==="
+          sleep 10
+        done
+        date -u
+        LINDIR=$(cat /tmp/lindir.txt)
+        echo "=== 编译后内核配置 hash（必须仍等于官方）==="
+        grep '=[ym]' "$LINDIR/.config.set" | LC_ALL=C sort | md5sum | cut -d' ' -f1
+        cat "$LINDIR/.vermagic"; echo
+        ls -lh bin/targets/mediatek/filogic/*cmcc_rax3000m*.itb 2>/dev/null || echo "（没出 itb）"
+        if [ "$build_ok" != 1 ]; then echo "=== 警告：3 次编译尝试后仍未成功（后续步骤据产物判定）==="; fi
     - name: 保存构建缓存
       uses: actions/cache/save@v4
       continue-on-error: true
